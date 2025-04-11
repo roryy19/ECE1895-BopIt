@@ -1,63 +1,31 @@
-/*******************************************************
- * STEP 1: Button Only
- * 
- * - States:
- *    IDLE (waiting for power on)
- *    WAITING_FOR_BUTTON (user must press the button)
- *    GAME_OVER
- *
- * - If user presses button correctly (while WAITING_FOR_BUTTON),
- *   they score a point and go to the next round.
- * - If user presses button at the wrong time or misses the
- *   time window, GAME_OVER => score = 0
- *******************************************************/
-
 #include <Arduino.h>
-#include <Wire.h> 
+#include <Wire.h>
 #include <LiquidCrystal_I2C.h>
+//#include <SoftwareSerial.h>
+#include <DFRobotDFPlayerMini.h>
 
 // Pin definitions
-const int BUTTON_PIN = 2; // pb 1
-const int KEY_PIN = 3; // pb 2
-const int POWER_PIN  = 7;
-const int SPEAKER_PIN = 8; // not used much here, just a placeholder
-// Set the LCD address to 0x27 for a 16 chars and 2 line display
+const int KEY_PIN = 10; // PB2 -> physical pin 16 on ATmega
+const int BUTTON_PIN = 9; // PB1 --> physical pin 15 on the ATmega
+
+// ATmega328P: pin 26 = D4 (TX), use D5 for RX
+// SoftwareSerial dfSerial(5, 4); // RX, TX
+DFRobotDFPlayerMini myDFPlayer;
+
+// set LCD address to 0x27 for 16 chars and 2 line display
 LiquidCrystal_I2C lcd(0x27, 16, 2);
-
-//const int rowPins[4] = {5, 10, 9, 7}; // R1, R2, R3, R4
-//const int colPins[3] = {6, 4, 8};     // C1, C2, C3
-
-const int rowPins[4] = {8, 4, 6, 7}; // R1, R2, R3, R4
-const int colPins[3] = {9, 10, 5};     // C1, C2, C3
-
-// Keypad map
-char keys[4][3] = {
-  {'1', '2', '3'},
-  {'4', '5', '6'},
-  {'7', '8', '9'},
-  {'*', '0', '#'}
-};
-
-// Keypad code logic
-const char correctCode[] = "1895";
-const int inputLength = sizeof(correctCode) - 1;
-char inputCode[inputLength];
-int inputIndex = 0;
 
 // For button interrupt
 volatile bool buttonPressed = false;
 volatile bool keyTwisted = false;
 volatile bool keyPressed = false;
-
 volatile unsigned long lastInterruptTime = 0;
 volatile unsigned long lastButtonInterrupt = 0;
 volatile unsigned long lastKeyInterrupt = 0;
-
 const unsigned long buttonDebounceDelay = 1000; // ms
 const unsigned long keyDebounceDelay = 2500;
 
-volatile bool lastButtonState = HIGH;
-volatile bool lastKeyState = HIGH;
+
 
 // Game states
 enum GameState {
@@ -77,6 +45,24 @@ unsigned long roundDeadline = 0;
 unsigned long roundTimeMs   = 30000; // 3 seconds, for example
 unsigned long roundDecMs    = 250;
 
+const char correctCode[] = "1895"; // code to input
+const int inputLength = sizeof(correctCode) - 1; // -1 for null terminator
+
+char inputCode[inputLength];
+int inputIndex = 0;
+
+// Define row and column pins
+const int rowPins[4] = {2, 3, 4, 5};  // R1, R2, R3, R4 --> PD2, PD3, PD4, PD5
+const int colPins[3] = {6, 7, 8};      // C1, C2, C3 --> PD6, PD7, PB0
+
+// Define key mappings for a standard 4x3 keypad
+char keys[4][3] = {
+  {'1', '2', '3'},
+  {'4', '5', '6'},
+  {'7', '8', '9'},
+  {'*', '0', '#'}
+};
+
 void handleButtonISR();
 void handleKeyISR();
 
@@ -88,20 +74,15 @@ void setup() {
 
   pinMode(BUTTON_PIN, INPUT_PULLUP);
   pinMode(KEY_PIN, INPUT_PULLUP);
-  pinMode(POWER_PIN, INPUT_PULLUP);
-  pinMode(SPEAKER_PIN, OUTPUT);
 
-  attachInterrupt(digitalPinToInterrupt(BUTTON_PIN), handleButtonISR, FALLING);
-  attachInterrupt(digitalPinToInterrupt(KEY_PIN), handleKeyISR, FALLING);
-
-  // Attach interrupt for button
-  //attachInterrupt(digitalPinToInterrupt(BUTTON_PIN), handleButtonISR, CHANGE);
-   // setup pin change interrupts for pb1 (d9) and pb2 (d10)
-  /*
+  // setup pin change interrupts for pb1 (d9) and pb2 (d10)
   PCICR |= (1 << PCIE0); // Enable PCINT for PORTB
   PCMSK0 |= (1 << PCINT1); // Enable PCINT1 for PB1 (D9)
   PCMSK0 |= (1 << PCINT2); // Enable PCINT2 for PB2 (D10)
-*/
+
+  // Attach interrupt for button and key
+  //attachInterrupt(digitalPinToInterrupt(BUTTON_PIN), handleButtonISR, CHANGE);
+  //attachInterrupt(digitalPinToInterrupt(KEY_PIN), handleKeyISR, CHANGE);
 
   // Set column pins as OUTPUTS
   for (int c = 0; c < 3; c++) {
@@ -114,28 +95,31 @@ void setup() {
     pinMode(rowPins[r], INPUT_PULLUP);
   }
 
-  // initialize the LCD
-	lcd.begin();
-  // Turn on the blacklight and print a message.
-	lcd.backlight();
-	displayScore();
-
-  Serial.println("Step 1: Button Only - Setup complete.");
-  srand(analogRead(A0));
+  Serial.println("Setup complete.");
 }
 
-void testLoop() {
-  char k = scanKeypad();
-  if (k) {
-    Serial.print("Key: "); Serial.println(k);
-    lcd.clear();
-    lcd.setCursor(0, 0);
-    lcd.print("Key: ");
-    lcd.print(k);
-    delay(300); // debounce
+// ------------------------------------
+// PIN CHANGE INTERRUPT HANDLER (PB1 = D9, PB2 = D10)
+// ------------------------------------
+ISR(PCINT0_vect) {
+  unsigned long now = millis();
+
+  // Check PB1 (D9) - BUTTON
+  if (!(PINB & (1 << PB1))) {
+    if (now - lastButtonInterrupt > buttonDebounceDelay) {
+      buttonPressed = true;
+      lastButtonInterrupt = now;
+    }
+  }
+
+  // Check PB2 (D10) - KEY
+  if (!(PINB & (1 << PB2))) {
+    if (now - lastKeyInterrupt > keyDebounceDelay) {
+      keyTwisted = true;
+      lastKeyInterrupt = now;
+    }
   }
 }
-
 
 // ------------------------------------
 // LOOP
@@ -155,16 +139,17 @@ void loop() {
 
   switch (gameState) {
     case IDLE:
-      if (powerIsOn) {
+      if (powerIsOn && buttonPressed) {
         // Start a new game
+        noInterrupts();
+        buttonPressed = false;
+        interrupts();
+
         score = 0;
-        Serial.println("Power ON => Starting game. Round 1: Press the button!");
+        Serial.println("Power ON => Starting game.");
         // Start the first round
         roundDeadline = millis() + roundTimeMs;
         gameState = getNewState();
-        //buttonPressed = false;
-        //keyTwisted = false;
-
       }
       break;
 
@@ -177,11 +162,6 @@ void loop() {
         score = 0;
         gameState = GAME_OVER;
       }
-
-      // Also check if button was pressed at the wrong time 
-      // (i.e., user pressed it outside of WAITING_FOR_BUTTON state).
-      // Actually, in this simplified version, pressing the button
-      // during WAITING_FOR_BUTTON is always correct. So no "wrong time" check here.
       break;
 
     case WAITING_FOR_KEY_TWIST:
@@ -200,6 +180,7 @@ void loop() {
       if (millis() > roundDeadline) {
         // Timed out => game over
         Serial.println("TIMEOUT => Game Over. Score reset to 0.");
+        displayGameOver();
         score = 0;
         gameState = GAME_OVER;
       }
@@ -211,7 +192,7 @@ void loop() {
       break;
   }
 
-  // ---------- BUTTON ----------
+  // button logic
   if (buttonPressed) {
     noInterrupts();
     buttonPressed = false;
@@ -221,8 +202,8 @@ void loop() {
     if (gameState == WAITING_FOR_BUTTON) {
       // It's correct
       score++;
-      //myDFPlayer.volume(20);
-      //myDFPlayer.play(1); // explosion sound
+      myDFPlayer.volume(20);
+      myDFPlayer.play(1); // explosion sound
       Serial.print("Correct button press! Score = ");
       Serial.println(score);
       displayScore();
@@ -234,6 +215,8 @@ void loop() {
       else {
         Serial.println("Congratulations! You Win! :)");
         displayVictory();
+        score = 0;
+        gameState = GAME_OVER;
         return;
       }
       roundDeadline = millis() + roundTimeMs;
@@ -243,11 +226,12 @@ void loop() {
       // => game over, score = 0
       Serial.println("Button pressed at wrong time => Game Over, score = 0.");
       displayGameOver();
+      score = 0;
       gameState = GAME_OVER;
     }
   }
 
-  // ---------- KEY TWIST ----------
+  // key twist logic
   if (keyTwisted) {
     noInterrupts();
     keyTwisted = false;
@@ -268,6 +252,8 @@ void loop() {
       else {
         Serial.println("Congratulations! You Win! :)");
         displayVictory();
+        score = 0;
+        gameState = GAME_OVER;
         return;
       }
       roundDeadline = millis() + roundTimeMs;
@@ -277,10 +263,12 @@ void loop() {
       // => game over, score = 0
       Serial.println("Key twisted at wrong time => Game Over, score = 0.");
       displayGameOver();
+      score = 0;
       gameState = GAME_OVER;
     }
   }
-  // ---------- KEYPAD ----------
+
+  // keypad logic
   if (key) {  // If a key is detected
     if (gameState == WAITING_FOR_KEYPAD) {
         Serial.print("Key Pressed: ");
@@ -288,12 +276,6 @@ void loop() {
 
         inputCode[inputIndex] = key;
         inputIndex++;
-
-        // Display the current partial code on line 2
-        lcd.setCursor(0, 1);
-        lcd.print("                "); // Clear line
-        lcd.setCursor(0, 1);
-        lcd.print(inputCode);    
 
         if (inputIndex == inputLength) {  // Only check after 4 key presses
             inputCode[inputIndex] = '\0';  // Null terminate the string
@@ -317,6 +299,8 @@ void loop() {
                 } else {
                     Serial.println("Congratulations! You Win! :)");
                     displayVictory();
+                    score = 0;
+                    gameState = GAME_OVER;
                     return;
                 }
                 roundDeadline = millis() + roundTimeMs;
@@ -326,53 +310,37 @@ void loop() {
     } else {  // Keypad pressed at the wrong time
         Serial.println("Keypad used at wrong time => Game Over, score = 0.");
         displayGameOver();
+        score = 0;
         gameState = GAME_OVER;
     }
 }
+
 }
 
-// Scan keypad
+// Function to scan the keypad
 char scanKeypad() {
   for (int c = 0; c < 3; c++) {
-    digitalWrite(colPins[c], LOW);
+    digitalWrite(colPins[c], LOW); // Activate this column
+
     for (int r = 0; r < 4; r++) {
-      if (digitalRead(rowPins[r]) == LOW) {
-        delay(200);
-        while (digitalRead(rowPins[r]) == LOW);
-        digitalWrite(colPins[c], HIGH);
-        return keys[r][c];
+      if (digitalRead(rowPins[r]) == LOW) { // If a key is pressed
+        delay(500); // Debounce
+        while (digitalRead(rowPins[r]) == LOW); // Wait for release
+        digitalWrite(colPins[c], HIGH); // Reset column
+
+        return keys[r][c]; // Return the key pressed
       }
     }
-    digitalWrite(colPins[c], HIGH);
-  }
-  return 0;
-}
 
-// ------------------------------------
-// ISR for button press (debounce)
-// ------------------------------------
-void handleButtonISR() {
-  unsigned long now = millis();
-  bool state = digitalRead(BUTTON_PIN) == LOW;
-  if (state && now - lastInterruptTime > buttonDebounceDelay) {
-    buttonPressed = true;
-    lastInterruptTime = now;
+    digitalWrite(colPins[c], HIGH); // Reset column
   }
+  
+  return 0; // No key pressed
 }
-
-// ISR for key twist (debounce)
-void handleKeyISR() {
-  unsigned long now = millis();
-  bool state = digitalRead(KEY_PIN) == LOW;
-  if (state && now - lastInterruptTime > keyDebounceDelay) {
-    keyTwisted = true;
-    lastInterruptTime = now;
-  }
-}
-
+ 
 // picking new state after each round
 GameState getNewState() {
-  inputIndex = 0;
+  //srand(time(NULL));
 
   // Generates a number 
   int n = 100;
@@ -383,33 +351,28 @@ GameState getNewState() {
     Serial.print("Next round! You have ");
     Serial.print(roundTimeMs / 1000.0);
     Serial.println(" seconds left. PRESS THE BUTTON!");
-    //myDFPlayer.volume(20);
-    //myDFPlayer.play(4); // nuke it
-    lcd.setCursor(0, 1);
-    lcd.print("Button");
+    myDFPlayer.volume(20);
+    myDFPlayer.play(4); // nuke it
     return WAITING_FOR_BUTTON;
   } 
-  // key twist state
-  else if (rnd < 67) {
+  // keypad state
+  else if (rnd > 33 && rnd <= 67) {
     Serial.print("Next round! You have ");
     Serial.print(roundTimeMs / 1000.0);
-    Serial.println(" seconds left. TWIST THE KEY!");
-    //myDFPlayer.volume(20);
-    //myDFPlayer.play(2); // twist it
-    lcd.setCursor(0, 1);
-    lcd.print("Key Twist");
-    return WAITING_FOR_KEY_TWIST;
+    Serial.println(" seconds left. ENTER 1895 ON THE KEYPAD!");
+    myDFPlayer.volume(20);
+    myDFPlayer.play(3); // code it 
+    displayKeypadCode();
+    return WAITING_FOR_KEYPAD;
   }
-  // keypad state
+  // key twist state
   else {
     Serial.print("Next round! You have ");
     Serial.print(roundTimeMs / 1000.0);
-    Serial.println(" seconds left. ENTER 1895!");
-    //myDFPlayer.volume(20);
-    //myDFPlayer.play(2); // twist it
-    lcd.setCursor(0, 1);
-    lcd.print("Enter 1895");
-    return WAITING_FOR_KEYPAD;
+    Serial.println(" seconds left. TWIST THE KEY!");
+    myDFPlayer.volume(20);
+    myDFPlayer.play(2); // twist it
+    return WAITING_FOR_KEY_TWIST;
   }
 }
 
@@ -418,6 +381,15 @@ void displayScore() {
   lcd.setCursor(0, 0);
   lcd.print("Score: ");
   lcd.print(score);
+}
+
+void displayKeypadCode() {
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("Score: ");
+  lcd.print(score);
+  lcd.setCursor(0, 1);
+  lcd.print("Enter 1895");
 }
 
 void displayGameOver() {
@@ -438,3 +410,20 @@ void displayVictory() {
   lcd.print(score);
 }
 
+// ISR for button press (debounce)
+void handleButtonISR() {
+  unsigned long now = millis();
+  if (now - lastInterruptTime > buttonDebounceDelay) {
+    buttonPressed = true;
+    lastInterruptTime = now;
+  }
+}
+
+// ISR for key twist (debounce)
+void handleKeyISR() {
+  unsigned long now = millis();
+  if (now - lastInterruptTime > keyDebounceDelay) {
+    keyTwisted = true;
+    lastInterruptTime = now;
+  }
+}
